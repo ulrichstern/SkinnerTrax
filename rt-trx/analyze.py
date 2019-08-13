@@ -508,7 +508,7 @@ class Trajectory:
       del nanrs[0]
     ls = [r.stop-r.start for r in nanrs]
     self._p("  lost: number frames: %d (%s)%s" %(sum(ls),
-      "{:.2%}".format(len(ls)/len(self.x)),
+      "{:.2%}".format(sum(ls)/len(self.x)),
       "" if not ls else ", sequence length: avg: %.1f, max: %d" %(
         sum(ls)/len(ls), max(ls))))
 
