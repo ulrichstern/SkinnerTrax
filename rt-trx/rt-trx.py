@@ -1319,22 +1319,24 @@ class Protocol:
     self._startTraining(f, trainT, msg)
     self.timeout[f] = offT
     while True:
-      inArea = self.inArea[f]   # state before event (e.g., enter)
       try:
         ev = self.eq[f].get(timeout=self.timeout[f])
+          # timeout=None: block until event (e.g., enter); no LED changes until
+          #  then
       except Queue.Empty:
         ev = 'T'
       if ev == 'quit':
         break
       # events to handle: 'en', 'ex', 'T'
+      inArea = self.inArea[f]
       if self.isOn[f]:
         if ev in offEvs:
-          self._setLed(f, val=0, timeout=offT)
+          self._setLed(f, val=0, timeout=offT if inArea else None)
       else:   # off
         if ev == 'T':
-          if self.inArea[f]:
+          if inArea:
             self._setLed(f, val=ledVal, timeout=onT)
-          else:
+          elif inArea is not None:
             self.timeout[f] = None
         elif ev == 'en':
           if random.random() < prob:
