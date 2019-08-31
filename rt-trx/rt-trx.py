@@ -26,6 +26,8 @@ from util import *
 # - - -
 
 BORDER_WIDTH = 2
+PAPER1 = False   # whether to skip using BORDER_WIDTH for regular chamber to
+                 #  match initial experiments
 
 DEBUG = False
 
@@ -33,6 +35,10 @@ SHOW_EVERY_NTH = 10   # "maximum speed" for video
 
 RESULTS_DIR = "res"
 FCC = "H264" if OPCV3 else "MJPG"   # recent OpenCV 3 versions can write H.264
+
+ET = enum.Enum('EventType', 'enter exit frame stop timeout')
+  # used to communicate, e.g., between the main thread (handling video capture)
+  #  and the threads for the experimental flies
 
 # - - -
 
@@ -837,7 +843,7 @@ class LedController:
 #   allowing, e.g., using delays and timeouts independently
 # * process(), e.g., sets self.inArea and sends events (e.g., "enter circle")
 #  via self.eq
-# * _sendQuitAfter() uses an additional thread to easily implement a timer
+# * _sendStopAfter() uses an additional thread to easily implement a timer
 #  to end a "training" phase of the procotol
 # TODO:
 # * use subclasses instead of ProtocolType
@@ -876,9 +882,7 @@ class Protocol:
 
     self.yco = opts.htl or opts.lgc   # yoked controls optional
     self.yc = not self.yco or opts.yc
-    self.bw = BORDER_WIDTH if (opts.htl or opts.lgc) else 0
-      # note: this should always be BORDER_WIDTH once matching old experiments
-      #  is no longer important
+    self.bw = BORDER_WIDTH if not PAPER1 or opts.htl or opts.lgc else 0
     self.byFlyInit()
 
   # init for each experimental fly
@@ -938,12 +942,12 @@ class Protocol:
               if any(inRect(fl[0], ra, bw=self.bw) for ra in area) else False)
           if inArea is not None:
             if self.inArea[f] is not None and inArea != self.inArea[f]:
-              self.eq[f].put('en' if inArea else 'ex')
+              self.eq[f].put(ET.enter if inArea else ET.exit)
             self.inArea[f] = inArea
       elif self.pt is self.PT.move:
         self.calcSpeed(fl)
         if self.spd is not None:
-          self.eq[f].put('fr')
+          self.eq[f].put(ET.frame)
       elif self.pt is self.PT.choice:
         # previous position kept if fly lost
         if fl is not None:
@@ -956,7 +960,10 @@ class Protocol:
   # called when user quits
   def quit(self):
     for f in range(self.nef):
-      self._stopTraining(f)
+      self.done[f] = True
+      self._sendStopAfter(f, 0)
+    while any(self.training): pass
+    time.sleep(.1)   # for _setLed() in _stopTraining() to be reached
 
   # notes:
   # * Standard (2-chamber) template:
@@ -1058,7 +1065,7 @@ class Protocol:
     self._pulseMode()
     self._emptyEQ(f)
     self._timestamp(f, 'startTrain')
-    self._sendQuitAfter(f, trainT)
+    self._sendStopAfter(f, trainT)
     self.hm.start(f, 'training%s' %(' '+hmName if hmName else ''))
     self.lastOff[f] = time.time()
     self.training[f], self.timeout[f], self.isOn[f] = True, None, False
@@ -1086,15 +1093,19 @@ class Protocol:
     while not self.eq[f].empty():
       self.eq[f].get_nowait()
 
-  def _sendQuitAfter(self, f, secs):
-    def sendQuit():
+  # to stop training
+  def _sendStopAfter(self, f, secs):
+    def sendStop():
       # note: f passed via closure (same for _condPulse(), etc.)
       time.sleep(secs)
-      self.eq[f].put('quit')
-    startDaemon(sendQuit)
-  def _waitForQuit(self, f):
+      self.eq[f].put(ET.stop)
+    if secs > 0:
+      startDaemon(sendStop)
+    else:
+      sendStop()
+  def _waitForStop(self, f):
     while True:
-      if self.eq[f].get() == 'quit':
+      if self.eq[f].get() is ET.stop:
         break
 
   def _timestamp(self, f, key):
@@ -1287,12 +1298,13 @@ class Protocol:
   # TODO: take out 'first' argument since only used for preT?
   def _areaTraining(self, f, preT, trainT, postT, area, msg, first=False,
       pulse=True):
+    if self.done[f]: return
     self._msg(f, preT, trainT, postT, msg)
 
     # customize
     # note: use None for onT or offT to not time out the on or off state
     onT, offT, ledVal, prob = .25, None, 25, 1.
-    offEvs = ('T',) if opts.lgc else ('T', 'ex')
+    offEvs = (ET.timeout,) if opts.lgc else (ET.timeout, ET.exit)
     numPulses = 1   # standard: 1x 3s pulse at ledVal
     pulseVal, pulseSecs, pulseBetween, pulsePost = ledVal, 3, 3, 3
 
@@ -1324,21 +1336,21 @@ class Protocol:
           # timeout=None: block until event (e.g., enter); no LED changes until
           #  then
       except Queue.Empty:
-        ev = 'T'
-      if ev == 'quit':
+        ev = ET.timeout
+      if ev is ET.stop:
         break
-      # events to handle: 'en', 'ex', 'T'
+      # events to handle: enter, exit, timeout
       inArea = self.inArea[f]
       if self.isOn[f]:
         if ev in offEvs:
           self._setLed(f, val=0, timeout=offT if inArea else None)
-      else:   # off
-        if ev == 'T':
+      else:   # LED off
+        if ev is ET.timeout:
           if inArea:
             self._setLed(f, val=ledVal, timeout=onT)
           elif inArea is not None:
             self.timeout[f] = None
-        elif ev == 'en':
+        elif ev is ET.enter:
           if random.random() < prob:
             self._setLed(f, val=ledVal, timeout=onT)
     self._stopTraining(f)
@@ -1349,6 +1361,7 @@ class Protocol:
 
   # - - -
 
+  # move protocol
   # customize
   # TODO: make this work for HtL, also
   def _moveProtocol(self, f):
@@ -1364,9 +1377,9 @@ class Protocol:
     self._startTraining(f, trainT)
     while True:
       ev = self.eq[f].get()
-      if ev == 'quit':
+      if ev is ET.stop:
         break
-      elif ev == 'fr':
+      elif ev is ET.frame:
         spdG = self.spd > spdTh
         on = spdG if onIfG else self.spd < spdTh
         self.onSffx = " %s %.2f" %(">" if spdG else "<", spdTh) if on else ""
@@ -1406,6 +1419,7 @@ class Protocol:
 
   # customize
   def _choiceTraining(self, f, tp, i):
+    if self.done[f]: return
     msg = str(i+1)
     if tp == 0:
       preT, trainT, postT = 30*self.MIN, 1*self.HOUR, 30*self.MIN
@@ -1442,7 +1456,7 @@ class Protocol:
     self._startTraining(f, trainT, msg)
     for j, reward in enumerate(rewardTB):
       self._rateReward(f, j == 0 if len(rewardTB) > 1 else None, reward)
-    self._waitForQuit(f)
+    self._waitForStop(f)
     self._stopTraining(f)
 
     self._postPeriod(f, postT)
@@ -1462,7 +1476,7 @@ class Protocol:
     # training
     self._startTraining(f, trainT)
     self._openLoop(f, ledVal, onT, offT=offT, alt=self.alt)
-    self._waitForQuit(f)
+    self._waitForStop(f)
     self._stopTraining(f)
 
     self._postPeriod(f, postT)
