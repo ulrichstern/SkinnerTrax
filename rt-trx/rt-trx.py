@@ -4,11 +4,11 @@
 # 2 Jul 2015 by Ulrich Stern
 #
 # TODO
-# * add background normalization
-# * add FlyDetector stats to writeData()
+# * add background normalization?
 # * VideoWriter:
 #  - write info for dropped frames?
 #  - add "no drop" mode?
+# * use common.py
 #
 # HOWTO
 # * control LEDs based on recorded video
@@ -195,6 +195,10 @@ opts = options()
 
 # - - -
 
+# background
+# * background is meant to not have flies
+# * uses background subtraction
+# * opts.channel determines which color channel is used
 class Background:
 
   _USE_EVERY = 10
@@ -317,6 +321,10 @@ class Background:
 
 # - - -
 
+# fly detector
+# * detects flies given foreground mask
+# * only one object picked for each chamber (frame is partitioned using
+#  separators)
 class FlyDetector:
 
   _NF_CONSECUTIVE = 1 if opts.htl else (3 if opts.lgc else 20)
@@ -461,7 +469,7 @@ class FlyDetector:
     if not self.idOn:
       return
 
-    # pick largest object as fly for each side
+    # pick largest object as fly for each chamber
     mas, nCols = self.nchm*[0], len(self.xSep)+1
     assert not self._SORT_ELLS   # for zip() below
     for (e, a) in zip(self.ells, self.ars):
@@ -563,7 +571,9 @@ class FlyDetector:
 # heatmaps of fly positions
 # * "running" heatmap for last opts.heatmap minutes
 # * "protocol" heatmap controlled by protocol (e.g., training time)
-# TODO: start with 0s and possibly add 1 in image()
+# * heatmaps are calculated "by chamber" to prevent a non-moving fly in one
+#  chamber to affect the other heatmaps
+# TODO: start with zeros and possibly add 1 in image()?
 class Heatmap:
 
   def __init__(self):
@@ -637,7 +647,7 @@ class Heatmap:
       self._addSubCpos(self._cpos.popleft(), add=False)
 
   # returns heatmap image and name or (None, None) if not yet started
-  # TODO: improve name
+  # TODO: improve function name
   def image(self, prtcl):
     if not self._started or (prtcl and not self._phStarted):
       return None, None
@@ -836,8 +846,7 @@ class LedController:
 # - - -
 
 # protocol for turning LEDs on and off
-# notes:
-# * the protocol is mainly executed in two or more threads:
+# * the protocol code is mainly executed in two or more threads:
 #  - process() is called by the "main" tracker thread for each frame
 #  - _runProtocol() runs in a separate thread for each experimental fly,
 #   allowing, e.g., using delays and timeouts independently
@@ -845,7 +854,7 @@ class LedController:
 #  via self.eq
 # * _sendStopAfter() uses an additional thread to easily implement a timer
 #  to end a "training" phase of the procotol
-# TODO:
+# TODO
 # * use subclasses instead of ProtocolType
 #  advantage: should make individual protocols small
 # * separate ProtocolManager and Protocol
@@ -981,7 +990,7 @@ class Protocol:
   def _matchTemplate(self):
     bg, htl, lgc = self.bg.get(), opts.htl, opts.lgc
     if False:   # for debugging
-      cv2.imwrite("tmp.jpg", bg)
+      cv2.imwrite("bg.png", bg)
     tm = match_template.match(
       bg if htl or lgc else cv2.resize(bg, (0,0), fx=2, fy=2),
       tmplN='HtL' if htl else ('LgC' if lgc else None))
@@ -1147,7 +1156,6 @@ class Protocol:
     startDaemon(condPulse)
 
   # reward at a certain rate
-  # notes:
   # * topIn: top (line) or in (circle), None for "position independent"
   # * reward: (ledVal, onT, interarrival time (it), it distribution)
   #  - e.g., (25, 0.25, 3, 'c')
@@ -1211,7 +1219,7 @@ class Protocol:
 
   # area (circle and rectangle) protocols
   # customize
-  # TODO: adjust r?
+  # TODO: adjust r based on template match factor?
   def _areaProtocol(self, f):
     if self.pt is self.PT.circle:
       # "standard" circle positions; format: (x, y[, r])
@@ -1292,7 +1300,6 @@ class Protocol:
           "%s %d" %(" ".join(rns), i+1), i == 0)
 
   # notes:
-  # * preT < 0: no initial pulse
   # * area: tuple with cPos or cPos and r (circle) or list with tlbr tuples
   #  (rectangles)
   # TODO: take out 'first' argument since only used for preT?
@@ -1535,14 +1542,14 @@ class Protocol:
 # - - -
 
 # camera control (exposure, etc.)
-# notes:
 # * camera control is camera specific
 # * code below works for Microsoft LifeCam
 # * to list available controls: v4l2-ctl -d 0 --list-ctrls-menus
 # * settings are saved when the tracker exits and loaded when it starts
 # * settings are saved for multiple cameras, with cameras identified by
 #  their "bus info" (e.g., "usb-0000:00:14.0-1"); an alternative would
-#  be to use, e.g., camera serial numbers
+#  be to use, e.g., camera serial numbers (which appeared difficult to
+#  determine)
 class CameraControl:
 
   # - - -
@@ -1799,13 +1806,12 @@ class CameraControl:
 # - - -
 
 # video writer
-# notes:
-# * use if camera's frame rate can differ from that of the video being written
+# * writes frames at a fixed rate even if camera's rate varies or is imprecise,
+#  possibly dropping or repeating frames in the process
 #  (note: for LifeCam, the frame rate depends on the exposure)
-# * drops frames if camera's frame rate exceeds video's frame rate
 # * also writes trajectories (which need to be in sync with frames written)
-# * stop() needs to be called at the end of video
-# * the call to stop() is automatic if VideoWriter is used with "with"
+# * stop() needs to be called at the end of video, unless VideoWriter is
+#  instantiated with "with"
 class VideoWriter:
 
   _EXT, _TRX_FILE = ".avi", "__trx"
@@ -1899,7 +1905,6 @@ class VideoWriter:
 # - - -
 
 # video shower
-# notes:
 # * displays video, including background or heatmap
 # * handles keyboard input
 class VideoShower:
@@ -1962,7 +1967,7 @@ class VideoShower:
 
 # - - -
 
-# write data; currently protocol data only
+# write data
 def writeData(vw, p, hm, fd):
   if opts.writeVideo:
     data = dict(command=' '.join(sys.argv), protocol=p.data(),
